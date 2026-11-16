@@ -147,6 +147,7 @@ def _upload(t: Target, ip: str, local: Path, remote: str, sha: str, size: int, m
     """scp to a unique temporary name, verify size, mode and SHA-256 on the target, then rename."""
     tmp = f"{remote}.part-{uuid.uuid4().hex[:8]}"
     t.put(local, tmp, timeout=300, ip=ip)
+    renamed = False
     try:
         r = t.ssh_script(f"chmod {mode} {quote_argv([tmp])} && {quote_argv([hasher or tmp, '-H', tmp])}", timeout=60, what="upload verification", ip=ip)
         got = _parse_runner(r.out, "upload verification")
@@ -157,11 +158,19 @@ def _upload(t: Target, ip: str, local: Path, remote: str, sha: str, size: int, m
                 hint="Retry; if it repeats, check free space on the target's /data partition.",
                 expected_sha256=sha, got_sha256=got.get("sha256"),
             )
-        t.ssh(["mv", "-f", tmp, remote], timeout=30, what="upload rename", ip=ip)
-    except BaseException:
-        with contextlib.suppress(QnxMcpError):
-            t.ssh(["rm", "-f", tmp], timeout=15, what="upload cleanup", ip=ip, check=False)
-        raise
+        try:
+            t.ssh(["mv", "-f", tmp, remote], timeout=30, what="upload rename", ip=ip)
+            renamed = True
+        except QnxMcpError as e:
+            # Another call on this target uploaded the same file first, and QNX refuses to replace an executable
+            # that is running. The call has what it needs if the file in place has the same bytes and mode.
+            got = _remote_hash(t, ip, hasher or remote, remote) if e.code == "remote_failed" else None
+            if not got or (got.get("sha256"), got.get("size"), got.get("mode")) != (sha, size, mode):
+                raise
+    finally:
+        if not renamed:
+            with contextlib.suppress(QnxMcpError):
+                t.ssh(["rm", "-f", tmp], timeout=15, what="upload cleanup", ip=ip, check=False)
 
 
 def prepare(t: Target, ip: str, files: list[tuple[Path, str, str, int, str]], mkdirs: list[str], prune: bool = False) -> str:

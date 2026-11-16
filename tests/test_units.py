@@ -1104,3 +1104,27 @@ def test_reconcile_stops_only_old_unacknowledged_starts(fake_target, monkeypatch
     assert states["r-000000000020"]["state"] == "failed" and states["r-000000000020"]["cleanup"] == "stopped"
     assert states["r-000000000020"]["error"] == "start not acknowledged"
     assert [states[r]["state"] for r in ("r-000000000021", "r-000000000022", "r-000000000023")] == ["starting", "starting", "running"]
+
+
+@pytest.mark.parametrize("dest,ok", [("same", True), ("other", False), ("missing", False)])
+def test_upload_race_with_identical_bytes_is_a_success(fake_target, dest, ok):
+    """Two calls can upload the same file; QNX refuses to replace a busy executable, so the second rename fails.
+    If the file in place has the wanted bytes and mode, the call succeeds."""
+    from qnx_mcp.ops import _upload
+    t, _, app = fake_target
+    sha, size = _sha(app), app.stat().st_size
+    remote = "/tmp/qnx-mcp/apps/0123456789abcdef/app"
+    busy = QnxMcpError("remote_failed", "upload rename on tb1 exited with status 1")
+    found = {"same": _reply(_runner_json(sha256=sha, size=size, mode="0755")),
+             "other": _reply(_runner_json(sha256="0" * 64, size=size, mode="0755")),
+             "missing": _reply(_runner_json(usage_error="open", error="No such file or directory"), 1)}[dest]
+    fake = FakeRemote(t, [_reply(), _reply(_runner_json(sha256=sha, size=size, mode="0755")), busy, found, _reply()])
+    if ok:
+        _upload(t, "10.0.0.1", app, remote, sha, size, "0755", "/tmp/qnx-mcp/bin/r")
+    else:
+        with pytest.raises(QnxMcpError) as e:
+            _upload(t, "10.0.0.1", app, remote, sha, size, "0755", "/tmp/qnx-mcp/bin/r")
+        assert e.value is busy
+    tmp = fake.calls[0][1][1]
+    assert fake.calls[3] == ("ssh", ["/tmp/qnx-mcp/bin/r", "-H", remote])
+    assert fake.calls[4] == ("ssh", ["rm", "-f", tmp]) and not fake.answers
