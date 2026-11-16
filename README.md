@@ -69,6 +69,7 @@ Configuration is by environment variable:
 | `QNX_MCP_DHCP_LEASES` | `/var/lib/libvirt/dnsmasq/virbr0.status` | Lease file used to find target addresses |
 | `QNX_MCP_TRUST_FIRST_USE` | not set | `1` accepts targets without pre-generated host keys by pinning the first key seen (weaker) |
 | `QNX_MCP_REMOTE_BINARY_ROOTS` | `/tmp:/data` | Colon-separated target directories below which `remote_binary` may start programs; set but empty refuses every `remote_binary`. Shells and `/proc/boot`, `/bin`, `/sbin`, `/usr`, `/system` are refused whatever it says |
+| `QNX_MCP_RUN_AS` | not set (programs run as root) | Numeric `uid:gid`, not 0: `deploy_and_run` and `run_start` start the agent's program as this user and group. The runner stays root. A value that is not numeric, or is 0, refuses every run (`config_error`) instead of running as root. Not yet tested on a target, see Security model |
 
 Target creation takes about 20 s with KVM (22 s in the last lifecycle test run, `target_start` 15 s), so raise client tool timeouts where a client has them.
 
@@ -318,19 +319,21 @@ The agent is treated as capable, fallible and possibly prompt-injected. The serv
 * **Builds run code.** `build` runs the project's own make or cmake files, which can execute anything on the build host. The allow-list covers only the arguments an agent passes, not the build files or sources in the tree. Only point it at trees you trust.
 * **Bounded execution.** Host commands run in their own process group with timeouts and capped output; cancelled calls kill their processes. Target programs have deadlines and output caps; cores are size-limited before download and after decompression.
 * **Locking.** Per-target `flock`: exclusive for lifecycle changes, shared for runs, probes and inspection, so `processes` works during a run and `target_stop` waits for runs in progress (both tested). Waiting fails with `target_busy` after 120 s.
-* **Privileges.** Programs run as root on the target, because mkqnximage development images log in as root, and a program the agent builds and runs can do anything root can. Use disposable development targets.
+* **Privileges.** qnx-mcp logs in to mkqnximage targets as root. By default the agent's programs run as root too, and a program the agent builds and runs can do anything root can. With `QNX_MCP_RUN_AS=uid:gid` the runner starts the program as that user instead. The runner keeps root for its own work (dumper, the core move, `/proc`), sets the program's supplementary groups to the gid alone, calls `setgid` and `setuid`, checks the real and effective ids, and checks that `setuid(0)` now fails. If any step fails the program does not start and the run ends with `exec_failed` and an `exec_error` that says so. The run directory becomes mode 0711 with files 0600, so the program cannot list or read the runner's files there or in other non-root runs; its default working directory is a fresh `work` directory it owns. Leftovers in `work` are removed by a process that has become that user, never with root's rights. Every run result carries `run_as`. `environment_check` and `target_status` report `privileges`: the login user, the program identity, and for each tool whether it acts as the server user, the login user or the agent's program, what it needs on the target, and whether that has been run on a target. **Not yet verified on a QNX target:** the drop itself, which errno each refused action returns, and whether dumper still writes and reports a core for a non-root program. `tests/test_nonroot_e2e.py` and `examples/escape_probe` check these on a target; until they pass, use disposable development targets.
 * **Data.** Cores, logs, run records and binary snapshots stay in the state directory (mode 0700, files 0600) on the build host.
 
 ## Tests
 
 ```sh
 cd tests
-python -m pytest -q -p no:asyncio test_units.py test_mcp_offline.py test_skill.py  # no QNX needed
+python -m pytest -q -p no:asyncio test_units.py test_mcp_offline.py test_skill.py test_nonroot.py  # no QNX needed
 python -m pytest -q -p no:asyncio test_build_sdk.py                                # needs the QNX SDP
 QNX_MCP_ALLOW_TARGETS='tb,tb[0-9]*' QNX_MCP_E2E_TARGET=tb \
   python -m pytest -q -s -p no:asyncio test_slice_e2e.py test_shellfree_e2e.py     # needs a running target
 QNX_MCP_ALLOW_TARGETS='tb,tb[0-9]*' QNX_MCP_E2E_TARGET=tb QNX_MCP_E2E_CREATE=tb2 \
   python -m pytest -q -s -p no:asyncio test_lifecycle_e2e.py                       # builds, boots and destroys tb2
+QNX_MCP_ALLOW_TARGETS='tb,tb[0-9]*' QNX_MCP_E2E_TARGET=tb QNX_MCP_E2E_RUN_AS=1000:1000 \
+  python -m pytest -q -s -p no:asyncio test_nonroot_e2e.py                         # non-root runs (not yet run)
 ```
 
 Last full run on the build box (v0.3.0, 4 Nov 2026, with `QNX_MCP_TARGETS_DIR` set to the box's targets directory): 92 passed in 161.1 s (67 unit, 5 offline MCP, 2 skill, 3 SDK build, 9 slice end-to-end, 3 shell-free end-to-end, 3 lifecycle end-to-end; log in [docs/evidence/test-run.log](docs/evidence/test-run.log); the v0.1 run is [test-run-v0.1.log](docs/evidence/test-run-v0.1.log)). The end-to-end tests drive the server through an MCP `ClientSession` over stdio.
@@ -339,7 +342,7 @@ Last full run on the build box (v0.3.0, 4 Nov 2026, with `QNX_MCP_TARGETS_DIR` s
 
 * **Builds run trusted code.** `build` runs the project's own make or cmake files with your user's rights on the build host; there is no sandbox. Only build trees you trust. Build arguments from the agent are allow-listed, but an agent that can write files in the workspace can write a build file that runs commands, or a source file that includes any host file the compiler can read and so shows it in diagnostics.
 * **Allow-list limits.** Flags outside the list are refused even when harmless, for example `-D` values with quotes or spaces, separate-argument forms such as `-D NAME` or `-I dir`, `-isystem`, linker scripts and `-Wl,-rpath`. Put such settings in the project's Makefile or CMakeLists.txt.
-* **Root on the target.** Programs run as root, because mkqnximage development images log in as root. Use disposable development targets.
+* **Root on the target.** qnx-mcp logs in as root, and programs run as root unless `QNX_MCP_RUN_AS` is set. Non-root runs have not been tested on a target yet. All non-root runs share one uid, so one run's program can reach another run's `work` directory and processes. Use disposable development targets.
 * **setsid escapes.** A descendant that calls `setsid()` leaves the program's process group and is not killed at the end of a run (`process_stop` may end it afterwards, since its executable is below `/tmp`; not tested with an escaped process).
 * **Races that remain in the v0.2 tools** (see the threat model under Security model):
   * `process_stop`: the process can still exec or change between the last check and a signal. The path rules judge the path the process was started with and what it resolves to now, so a symlink replaced after launch, or a hard link to a system program placed below `/tmp`, can mislead them. The creation token is taken by `process_stop` itself, so it does not cover the time since the agent's last `processes` call. Children of the process are not signalled.
